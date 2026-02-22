@@ -48,6 +48,82 @@ class RowResult:
     error: str
 
 
+class ProgressTracker:
+    """Prints clean periodic progress updates suitable for Windows CMD."""
+
+    def __init__(self, total: int, progress_interval: int) -> None:
+        self.total = total
+        self.progress_interval = max(1, progress_interval)
+        self.started_at = time.monotonic()
+        self.last_print_at = self.started_at
+
+        self.completed = 0
+        self.ok_count = 0
+        self.failed_count = 0
+        self._completion_times: deque[float] = deque(maxlen=50)
+
+    def print_starting(self, concurrency: int) -> None:
+        print(
+            f"Starting... total usernames: {self.total}, concurrency: {concurrency}",
+            flush=True,
+        )
+
+    def _format_eta(self, eta_seconds: float) -> str:
+        eta_seconds = max(0, int(eta_seconds))
+        hours, rem = divmod(eta_seconds, 3600)
+        minutes, seconds = divmod(rem, 60)
+        if hours > 0:
+            return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+        return f"{minutes:02d}:{seconds:02d}"
+
+    def _rolling_seconds_per_item(self) -> float | None:
+        if len(self._completion_times) < 2:
+            return None
+        window_elapsed = self._completion_times[-1] - self._completion_times[0]
+        window_items = len(self._completion_times) - 1
+        if window_elapsed <= 0 or window_items <= 0:
+            return None
+        return window_elapsed / window_items
+
+    def maybe_print(self, row: RowResult, force: bool = False) -> None:
+        self.completed += 1
+        if row.status == "ok":
+            self.ok_count += 1
+        else:
+            self.failed_count += 1
+
+        now = time.monotonic()
+        self._completion_times.append(now)
+
+        due_to_count = self.completed % self.progress_interval == 0
+        due_to_time = (now - self.last_print_at) >= 30
+        finished = self.completed == self.total
+        if not (force or due_to_count or due_to_time or finished):
+            return
+
+        elapsed = now - self.started_at
+        avg_speed = self.completed / elapsed if elapsed > 0 else 0.0
+        sec_per_item = self._rolling_seconds_per_item()
+        if sec_per_item is None:
+            sec_per_item = elapsed / self.completed if self.completed else 0.0
+
+        remaining = self.total - self.completed
+        eta = sec_per_item * remaining
+        percent = (self.completed / self.total) * 100 if self.total else 100.0
+
+        print(
+            "Progress "
+            f"{self.completed}/{self.total} "
+            f"({percent:.1f}%) | "
+            f"ok: {self.ok_count} | "
+            f"failed: {self.failed_count} | "
+            f"speed: {avg_speed:.3f} acc/s | "
+            f"ETA: {self._format_eta(eta)}",
+            flush=True,
+        )
+        self.last_print_at = now
+
+
 class AdaptiveController:
     """Controls effective concurrency and delay scaling based on recent failures."""
 
@@ -262,6 +338,7 @@ async def run_scrape(
     headed: bool,
     nav_timeout_ms: int,
     selector_timeout_ms: int,
+    progress_interval: int,
 ) -> list[RowResult]:
     results: list[RowResult] = []
     results_lock = asyncio.Lock()
@@ -272,6 +349,9 @@ async def run_scrape(
 
     for username in usernames:
         await queue.put(username)
+
+    tracker = ProgressTracker(total=len(usernames), progress_interval=progress_interval)
+    tracker.print_starting(concurrency=concurrency)
 
     controller = AdaptiveController(concurrency, min_delay, max_delay)
 
@@ -311,6 +391,7 @@ async def run_scrape(
 
                     async with results_lock:
                         results.append(row)
+                        tracker.maybe_print(row)
                 finally:
                     await controller.release_slot()
                     queue.task_done()
@@ -351,6 +432,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-delay", type=float, default=1.2, help="Minimum jitter delay seconds")
     parser.add_argument("--max-delay", type=float, default=2.8, help="Maximum jitter delay seconds")
     parser.add_argument("--retries", type=int, default=3, help="Retries per username")
+    parser.add_argument(
+        "--progress-interval",
+        type=int,
+        default=10,
+        help="Print progress every N completions (default: 10)",
+    )
     parser.add_argument("--headed", action="store_true", help="Run browser in headed mode")
     parser.add_argument("--nav-timeout-ms", type=int, default=45_000, help="Navigation timeout")
     parser.add_argument(
@@ -382,6 +469,7 @@ async def async_main(args: argparse.Namespace) -> int:
         headed=args.headed,
         nav_timeout_ms=max(5_000, args.nav_timeout_ms),
         selector_timeout_ms=max(3_000, args.selector_timeout_ms),
+        progress_interval=max(1, args.progress_interval),
     )
     elapsed = time.time() - start
 
@@ -392,7 +480,7 @@ async def async_main(args: argparse.Namespace) -> int:
     failed_rows = [r for r in rows if r.status != "ok"]
     total_followers = sum(r.followers_number for r in ok_rows if r.followers_number is not None)
 
-    print(f"Saved: {output_path}")
+    print(f"Output CSV path: {output_path.resolve()}")
     print(f"Total usernames processed: {len(rows)}")
     print(f"OK count: {len(ok_rows)}")
     print(f"Failed count: {len(failed_rows)}")
